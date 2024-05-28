@@ -1,0 +1,241 @@
+#!/bin/sh
+
+# reimplementation of a shell script-based alarm clock
+
+# todo: make it use /usr/share/shalarm as well, when root
+
+# safe printf
+alias printf="printf --"
+
+# usage info
+usage() {
+    printf "Usage: %s [DATE][MODIFIER]... [OPTIONS]\n" "${0##*/}"
+}
+
+# print lines
+printlns() {
+    for line in "$@"; do printf "$line\n"; done
+}
+
+# rudimentary 'unset' for shells that don't have it
+command -v unset >/dev/null 2>&1 || eval 'unset() {
+    for _k in "$@"; do
+        eval "$_k="
+        eval "$_k() { return 127; }"
+    done; _k=""
+}'
+
+# help info
+help() {
+    printlns \
+        "Set an alarm and/or a timer to go off at a specific time.\n" \
+        "Accepted Date Formats:" \
+        "  HH        set the alarm for HH:00:00" \
+        "  HHMM      set the alarm for HH:MM:00" \
+        "  HH:MM     same as above" \
+        "  HHMMSS    set the alarm for HH:MM:SS" \
+        "  HH:MM:SS  same as above\n" \
+        "Modifiers:" \
+        "  +/-Ns  add/subtract N seconds to the timer duration" \
+        "  +/-Nm  add/subtract N minutes to the timer duration" \
+        "  +/-Nh  add/subtract N hours to the timer duration" \
+        "  +/-Nd  add/subtract N days to the timer duration" \
+        "  =Ns    set the snooze duration to N seconds" \
+        "  =Nm    set the snooze duration to N minutes" \
+        "  =Nh    set the snooze duration to N hours" \
+        "  =Nd    set the snooze duration to N days\n" \
+        "Options:" \
+        "  -h, --help     shows this message" \
+        "  -m, --message  override the default message printed when the alarm goes off" \
+        "  -s, --snooze   enable snoozing even in scenarios where it doesn't make sense" \
+        "  -t, --test     test the alarm" \
+        "  -v, --version  show version information (useless)"
+}
+
+# try to create directory
+try_mkdir() {
+    mkdir -pv "$1" || exit "$?"
+}
+
+# case statement wrapper
+str_match() {
+    str="$1"
+    shift; for _str in "$@"; do
+        eval "case \"\$str\" in $_str) return 0 ;; esac"
+    done
+    return 1
+}
+
+# rudimentary 'which' for environments that don't have it
+command -v which >/dev/null 2>&1 || which() {
+    IFS=":"
+    for dir in $PATH; do
+        test -x "$dir/$1" && printf "%s\n" "$dir/$1" && unset dir && return 0
+    done
+    IFS="$(printf ' \t\n')"
+    unset dir
+    return 1
+}
+
+# this function tests the currently selected media player, if any
+test_player() {
+    test -n "$1" && player_cmd="$1"
+    test -n "$player_cmd" && test -x "$player_cmd" && return 0
+    test -n "$player_cmd" && test -x "$(which "$player_cmd" 2>/dev/null)" && player_cmd="$(which "$player_cmd" 2>/dev/null)" && return 0
+    test -n "$player_cmd" && test -n "$(command -v "$player_cmd")" && return 0
+    test -n "$player_cmd" && test -z "$1" && printf "warning: cannot find media player %s\n" "$player_cmd" && substitute_player="y" && return 1
+    return 1
+}
+
+# find a media player
+find_player() {
+    common_players="mplayer mplayer2 mpv play cvlc aplay"
+    for player in $common_players; do
+        test_player "$player" || continue
+        player_opts=""
+        test "$substitute_player" = "y" && printf "using %s instead\n" "$player"
+        return 0
+    done
+    printf "Error: can't find a media player to use\nTry installing one of: %s\n" "$common_players"
+    exit 1
+}
+
+# find a sound file
+find_sound() {
+    test -r "$sound" && return 0
+    test -d "$sounds" || try_mkdir "$sounds" || exit "$?"
+    test -n "$sound" -a -r "$sounds/${sound##*/}" && sound="$sounds/${sound##*/}" && return 0
+    test -n "$sound" && printf "warning: cannot find %s, another sound will be used\n" "$sound"
+    sound="$(for snd in "$sounds"/*; do test -r "$snd" -a -f "$snd" && printf "%s\n" "$snd"; done | awk -v random="$(date +%s 2>/dev/null)$$$PPID$RANDOM$LINES$COLUMNS$UID$EUID$GID$EGID$LINENO$BASH_PID$RANDOM_SEED$RANDOM_MIN$RANDOM_MAX$SHLVL" 'BEGIN { srand(random); } { lines[NR] = $0; } END { print lines[int(rand() * NR) + 1]; }')"
+    test -z "$sound" && printf "error: cannot find any sounds in %s\n" "$sounds" && exit 1
+}
+
+# exit signal handler
+ctrlc() {
+    test "$snoozing" != "y" && printf "\nExiting\n\n" && exit 0
+    test "$alarm_ringing" = "1" && printf "\nSnoozing for %d seconds\n\n" "$snooze" && start_snoozing && return 0
+    printf "\nExiting\n\n"
+    exit 0
+}
+
+# parse alarm string
+parse_alarm() {
+    timer=""
+    snooze=""
+    arg="${1%%+*}"
+    arg="${arg%%-*}"
+    arg="${arg%%=*}"
+    str_match "${arg:-00}" '[0-2][0-3]*' '[0-1][0-9]*' || ! printf "error: %s: invalid time format\n" "$arg" || exit 1
+    str_match "$arg" '[0-2][0-3]' '[0-1][0-9]' && hour="${arg%%${arg##??}}" && minute="00" && second="00" && arg="${1##$arg}"
+    str_match "$arg" '[0-9][0-9]:[0-5][0-9]' '[0-9][0-9][0-5][0-9]' && hour="${arg%%${arg##??}}" && minute="${arg##${hour}}" && minute="${minute##:}" && second="00" timer="" && arg="${1##$arg}"
+    str_match "$arg" '[0-9][0-9][0-5][0-9][0-5][0-9]' '[0-9][0-9]:[0-5][0-9]:[0-5][0-9]' '[0-9][0-9]:[0-5][0-9][0-5][0-9]' '[0-9][0-9][0-5][0-9]:[0-5][0-9]' && hour="${arg%%${arg##??}}" && minute="${arg##${hour}}" && minute="${minute##:}" && minute="${minute%%${minute##??}}" && second="${arg##$hour}" && second="${second##:}" && second="${second##$minute}" && second="${second##:}" && arg="${1##$arg}"
+    str_match "$arg" '[0-9]*' && printf "error: %s: invalid time format\n" "$arg" && exit 1
+    test -z "$arg" && str_match "$1" '[+=-]*' && arg="$1"
+    for narg in $(printf "$arg" | sed 's/\([+=-]\)/ \1/g'); do
+        test -n "$(printf "$narg" | sed 's/[+=-][0-9.][0-9.]*[dhms]//g')" && printf "error: %s: invalid modifier format\n" "$narg" && exit 1
+        str_match "$narg" '+*d' && narg="${narg##+}" && timer="$(awk -v prev="$timer" -v mod="${narg%%d*}" 'BEGIN{printf("%d", prev+(mod*86400))}')" && continue
+        str_match "$narg" '+*h' && narg="${narg##+}" && timer="$(awk -v prev="$timer" -v mod="${narg%%h*}" 'BEGIN{printf("%d", prev+(mod*3600))}')" && continue
+        str_match "$narg" '+*m' && narg="${narg##+}" && timer="$(awk -v prev="$timer" -v mod="${narg%%m*}" 'BEGIN{printf("%d", prev+(mod*60))}')" && continue
+        str_match "$narg" '+*s' && narg="${narg##+}" && timer="$(awk -v prev="$timer" -v mod="${narg%%s*}" 'BEGIN{printf("%d", prev+(mod))}')" && continue
+        str_match "$narg" '-*d' && narg="${narg##-}" && timer="$(awk -v prev="$timer" -v mod="${narg%%d*}" 'BEGIN{printf("%d", prev-(mod*86400))}')" && continue
+        str_match "$narg" '-*h' && narg="${narg##-}" && timer="$(awk -v prev="$timer" -v mod="${narg%%h*}" 'BEGIN{printf("%d", prev-(mod*3600))}')" && continue
+        str_match "$narg" '-*m' && narg="${narg##-}" && timer="$(awk -v prev="$timer" -v mod="${narg%%m*}" 'BEGIN{printf("%d", prev-(mod*60))}')" && continue
+        str_match "$narg" '-*s' && narg="${narg##-}" && timer="$(awk -v prev="$timer" -v mod="${narg%%s*}" 'BEGIN{printf("%d", prev-(mod))}')" && continue
+        str_match "$narg" '=*d' && narg="${narg##=}" && snooze="$(awk -v mod="${narg%%d*}" 'BEGIN{printf("%d", mod*86400)}')" && continue
+        str_match "$narg" '=*h' && narg="${narg##=}" && snooze="$(awk -v mod="${narg%%h*}" 'BEGIN{printf("%d", mod*3600)}')" && continue
+        str_match "$narg" '=*m' && narg="${narg##=}" && snooze="$(awk -v mod="${narg%%m*}" 'BEGIN{printf("%d", mod*60)}')" && continue
+        str_match "$narg" '=*s' && narg="${narg##=}" && snooze="$(awk -v mod="${narg%%s*}" 'BEGIN{printf("%d", mod)}')" && continue
+    done
+    test "${timer:-0}" -lt 0 && printf "warning: timer set to negative integer %s, resetting\n" "$timer" && timer="0"
+}
+
+# format a timer duration
+fmt_timestamp() {
+    _seconds="$1"
+    _days="$((_seconds / 86400))"
+    _seconds="$((_seconds % 86400))"
+    _hours="$((_seconds / 3600))"
+    _seconds="$((_seconds % 3600))"
+    _minutes="$((_seconds / 60))"
+    _seconds="$((_seconds % 60))"
+    printf "$(test "$_days" -gt 0 && printf "%%d%%s%%s%%s")" "$_days" "$(if test "$time_fmt" = "s"; then printf "d"; else printf " day"; fi)" "$(test "$_days" != "1" -a "$time_fmt" != "s" && printf "s")" "$(test "$_hours" = "0" -a "$_minutes" = "0" -a "$_seconds" = "0" || (test "$time_fmt" = "s" || printf ","; printf " "))"
+    printf "$(test "$_hours" -gt 0 && printf "%%d%%s%%s%%s")" "$_hours" "$(if test "$time_fmt" = "s"; then printf "h"; else printf " hour"; fi)" "$(test "$_hours" != "1" -a "$time_fmt" != "s" && printf "s")" "$(test "$_minutes" = "0" -a "$_seconds" = "0" || (test "$time_fmt" = "s" || printf ","; printf " "))"
+    printf "$(test "$_minutes" -gt 0 && printf "%%d%%s%%s%%s")" "$_minutes" "$(if test "$time_fmt" = "s"; then printf "m"; else printf " minute"; fi)" "$(test "$_minutes" != "1" -a "$time_fmt" != "s" && printf "s")" "$(test "$_seconds" = "0" -a "$_seconds" = "0" || (test "$time_fmt" = "s" || printf ","; printf " "))"
+    printf "$(test "$_seconds" != "0" && printf "%%s%%s%%s")" "$_seconds" "$(if test "$time_fmt" = "s" -o "${_seconds%%.*}" = "0"; then printf "s"; else printf " second"; fi)" "$(test "$_seconds" != "1" -a "$_seconds" != "1.000" -a "${_seconds%%.*}" != "0" -a "$time_fmt" != "s" && printf "s")"
+}
+
+# beginning of script
+# --------------------------------------------------------------------------------------------------
+
+# run ctrlc when the INT signal (ctrl-c) is issued
+trap ctrlc INT
+
+# permission mode
+test "${EUID:-${UID:-$(id -u 2>/dev/null || awk '/Uid/ {print $2}' </proc/self/status 2>/dev/null)}}" = "0" && system_mode="y"
+
+# set config dir
+test -d "${XDG_CONFIG_HOME:-$HOME/.config}/shalarm" && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/shalarm"
+test -d "/usr/share/shalarm" && config_dir="/usr/share/shalarm"
+test -d "/usr/local/share/shalarm" && config_dir="/usr/local/share/shalarm"
+test -d "SHALARM_DATADIR""/shalarm" && config_dir="SHALARM_DATADIR""/shalarm"
+test -d "${XDG_CONFIG_HOME:-$HOME/.config}/shalarm" -a -z "$system_mode" && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/shalarm"
+test -z "$config_dir" -a -z "$system_mode" && try_mkdir "${XDG_CONFIG_HOME:-$HOME/.config}/shalarm/sounds" && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/shalarm"
+test -z "$config_dir" -a -n "$system_mode" -a -n "$(printf "SHALARM_DATADIR" | sed 's/^SHALARM_DATADIR$//g')" && try_mkdir "$(printf "SHALARM_DATADIR" | sed 's/^SHALARM_DATADIR$//g')/shalarm/sounds" && config_dir="$(printf "SHALARM_DATADIR" | sed 's/^SHALARM_DATADIR$//g')/shalarm"
+
+# stuff found in the config dir
+sounds="${config_dir:=${XDG_CONFIG_HOME:-$HOME/.config}/shalarm}/sounds"
+config_file="${config_dir:=${XDG_CONFIG_HOME:-$HOME/.config}/shalarm}/shalarm.conf"
+
+# config variables
+alarm_msg="WAKE UP!"
+check_delay="0.5"
+player_args=""
+player_cmd=""
+repeat_alarm_msg="y"
+sound=""
+use_alarm_msg="y"
+time_fmt="s"
+
+# script variables
+alarm_timeout="0"
+player_pid="0"
+ring_the_alarm="0"
+snooze="0"
+snoozing="0"
+
+# read config file
+test -r "$config_file" -a -f "$config_file" && . "$config_file"
+find_sound
+test_player || find_player
+
+# error if no args
+test -z "$1" && usage && printf "Use '%s --help' for more information.\n" "${0##*/}" && exit 1
+
+# parse args
+for opt in "$@"; do
+    str_match "$opt" '-h|--help' && usage && help && exit 0
+    str_match "$opt" '-s|--snooze' && forcesnooze="y" && continue
+    str_match "$opt" '-t|--test' && testing="y" && continue
+    str_match "$opt" '-v|--version' && printf "not shalarm-1.7\n" && exit 0
+    parse_alarm "$opt"
+done
+
+# set the test alarm
+test "$testing" = "y" && unset hour minute second timer snooze && timer="3"
+
+# decide whether the alarm goes off today or tomorrow
+test -n "$hour" -a -n "$minute" -a -n "$second" && {
+    test "${hour#0}" -lt "$(date +%-H)" && tomorrow="y"
+    test "${hour#0}" -le "$(date +%-H)" -a "${minute#0}" -lt "$(date +%-M)" && tomorrow="y"
+    test "${hour#0}" -le "$(date +%-H)" -a "${minute#0}" -le "$(date +%-M)" -a "${second#0}" -le "$(date +%-S)" && tomorrow="y"
+}
+
+# get the amount of time that will pass before the alarm goes off
+test -n "$hour" -a -n "$minute" -a -n "$second" && {
+    sched_time="$(((${hour#0}-$(date +%-H)+$(test "$tomorrow" = "y" && printf "24" || printf "0"))*3600))"
+    sched_time="$((sched_time+((($(date +%-M)*-1)+${minute#0})*60)))"
+    sched_time="$((sched_time+(($(date +%-S)*-1)+${second#0})))"
+}
+
+# print status message
+test -n "$sched_time" && printf "\nAlarm scheduled for%s %s\n%s left before it rings\nUse ^C to quit\n\n" "$(test "$tomorrow" = "y" && printf " tomorrow at")" "$hour:$minute$(test "$second" != "00" && printf ":$second")" "$(fmt_timestamp "$sched_time")"
