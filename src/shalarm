@@ -2,8 +2,6 @@
 
 # reimplementation of a shell script-based alarm clock
 
-# todo: make it use /usr/share/shalarm as well, when root
-
 # safe printf
 alias printf="printf --"
 
